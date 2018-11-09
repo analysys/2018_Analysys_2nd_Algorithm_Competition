@@ -1,0 +1,55 @@
+{
+	"comment": "",
+	"ignore": "test",
+	"package": [
+		{
+			"checksumSHA1": "YD2GnpBlboXLPitzH8pkkLor8FU=",
+			"path": "github.com/json-iterator/go",
+			"revision": "cdbd2ed8105904f45698861f5abe9fa354c1f92a",
+			"revisionTime": "2017-08-22T02:39:01Z"
+		},
+		{
+			"checksumSHA1": "id/Btx5mGz6HutuiinNuFRPIdMQ=",
+			"path": "github.com/kshvakov/clickhouse",
+			"revision": "4e2869334f3815d257318e813e2627efce90a0d7",
+			"revisionTime": "2018-08-24T10:42:06Z"
+		},
+		{
+			"checksumSHA1": "rNjgsSrtZWHxdSsvABV9vVl4nvM=",
+			"path": "github.com/kshvakov/clickhouse/lib/binary",
+			"revision": "4e2869334f3815d257318e813e2627efce90a0d7",
+			"revisionTime": "2018-08-24T10:42:06Z"
+		},
+		{
+			"checksumSHA1": "QXt9xChGhpe2zkW3/HPiTZjaHF4=",
+			"path": "github.com/kshvakov/clickhouse/lib/column",
+			"revision": "4e2869334f3815d257318e813e2627efce90a0d7",
+			"revisionTime": "2018-08-24T10:42:06Z"
+		},
+		{
+			"checksumSHA1": "UBAKtH0Q7d3jQxEkUnpUTmIrf7Q=",
+			"path": "github.com/kshvakov/clickhouse/lib/data",
+			"revision": "4e2869334f3815d257318e813e2627efce90a0d7",
+			"revisionTime": "2018-08-24T10:42:06Z"
+		},
+		{
+			"checksumSHA1": "ufET0wbq25geHjZiCY3tu4FlLeU=",
+			"path": "github.com/kshvakov/clickhouse/lib/protocol",
+			"revision": "4e2869334f3815d257318e813e2627efce90a0d7",
+			"revisionTime": "2018-08-24T10:42:06Z"
+		},
+		{
+			"checksumSHA1": "2NkAImVkCkMciWGlgjhcL14x4/U=",
+			"path": "github.com/kshvakov/clickhouse/lib/types",
+			"revision": "4e2869334f3815d257318e813e2627efce90a0d7",
+			"revisionTime": "2018-08-24T10:42:06Z"
+		},
+		{
+			"checksumSHA1": "yxaizsc0g9UElhfIEl0i3FvL3b0=",
+			"path": "github.com/kshvakov/clickhouse/lib/writebuffer",
+			"revision": "4e2869334f3815d257318e813e2627efce90a0d7",
+			"revisionTime": "2018-08-24T10:42:06Z"
+		}
+	],
+	"rootPath": "github.com/housepower/olap2018"
+}

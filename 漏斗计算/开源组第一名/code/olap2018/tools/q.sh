@@ -1,0 +1,1 @@
+clickhouse-client   -t  --host 10.9.100.60  --distributed_group_by_no_merge 1  <  $1 

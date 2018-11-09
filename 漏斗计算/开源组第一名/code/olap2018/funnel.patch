@@ -1,0 +1,2047 @@
+diff --git a/dbms/CMakeLists.txt b/dbms/CMakeLists.txt
+index 0cb5824e1..9f2e2b5be 100644
+--- a/dbms/CMakeLists.txt
++++ b/dbms/CMakeLists.txt
+@@ -84,6 +84,7 @@ add_headers_and_sources(dbms src/Storages/Kafka)
+ add_headers_and_sources(dbms src/Storages/MergeTree)
+ add_headers_and_sources(dbms src/Client)
+ add_headers_and_sources(dbms src/Formats)
++add_headers_and_sources(dbms src/Compression)
+ 
+ list (APPEND clickhouse_common_io_sources ${CONFIG_BUILD})
+ list (APPEND clickhouse_common_io_headers ${CONFIG_VERSION} ${CONFIG_COMMON})
+diff --git a/dbms/programs/client/Client.cpp b/dbms/programs/client/Client.cpp
+index bf57d072f..73ea56405 100644
+--- a/dbms/programs/client/Client.cpp
++++ b/dbms/programs/client/Client.cpp
+@@ -844,7 +844,7 @@ private:
+         }
+         else if (print_time_to_stderr)
+         {
+-            std::cerr << watch.elapsedSeconds() << "\n";
++            std::cerr << "[Log] Cost seconds -> " << watch.elapsedSeconds() << "\n";
+         }
+ 
+         return true;
+diff --git a/dbms/src/AggregateFunctions/AggregateFunctionWindowFunnel.cpp b/dbms/src/AggregateFunctions/AggregateFunctionWindowFunnel.cpp
+index 4b8222963..4031854f2 100644
+--- a/dbms/src/AggregateFunctions/AggregateFunctionWindowFunnel.cpp
++++ b/dbms/src/AggregateFunctions/AggregateFunctionWindowFunnel.cpp
+@@ -10,6 +10,7 @@ namespace DB
+ namespace
+ {
+ 
++template <bool repeated = false>
+ AggregateFunctionPtr createAggregateFunctionWindowFunnel(const std::string & name, const DataTypes & arguments, const Array & params)
+ {
+     if (params.size() != 1)
+@@ -21,14 +22,15 @@ AggregateFunctionPtr createAggregateFunctionWindowFunnel(const std::string & nam
+     if (arguments.size() > AggregateFunctionWindowFunnelData::max_events + 1)
+         throw Exception("Too many event arguments for aggregate function " + name, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+ 
+-    return std::make_shared<AggregateFunctionWindowFunnel>(arguments, params);
++    return std::make_shared<AggregateFunctionWindowFunnel<repeated>>(arguments, params);
+ }
+ 
+ }
+ 
+ void registerAggregateFunctionWindowFunnel(AggregateFunctionFactory & factory)
+ {
+-    factory.registerFunction("windowFunnel", createAggregateFunctionWindowFunnel, AggregateFunctionFactory::CaseInsensitive);
++    factory.registerFunction("windowFunnel", createAggregateFunctionWindowFunnel<false>, AggregateFunctionFactory::CaseInsensitive);
++    factory.registerFunction("windowRepeatedFunnel", createAggregateFunctionWindowFunnel<true>, AggregateFunctionFactory::CaseInsensitive);
+ }
+ 
+ }
+diff --git a/dbms/src/AggregateFunctions/AggregateFunctionWindowFunnel.h b/dbms/src/AggregateFunctions/AggregateFunctionWindowFunnel.h
+index c9a4e6b32..a8d5fe1df 100644
+--- a/dbms/src/AggregateFunctions/AggregateFunctionWindowFunnel.h
++++ b/dbms/src/AggregateFunctions/AggregateFunctionWindowFunnel.h
+@@ -18,8 +18,8 @@ namespace DB
+ {
+ namespace ErrorCodes
+ {
+-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+-    extern const int TOO_MANY_ARGUMENTS_FOR_FUNCTION;
++extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
++extern const int TOO_MANY_ARGUMENTS_FOR_FUNCTION;
+ }
+ 
+ struct ComparePairFirst final
+@@ -131,12 +131,13 @@ struct AggregateFunctionWindowFunnelData
+ 
+ /** Calculates the max event level in a sliding window.
+   * The max size of events is 32, that's enough for funnel analytics
+-  *
++  * repeated indicates is there any repeated conditions, default to false
+   * Usage:
+   * - windowFunnel(window)(timestamp, cond1, cond2, cond3, ....)
+   */
++template <bool repeated = false>
+ class AggregateFunctionWindowFunnel final
+-    : public IAggregateFunctionDataHelper<AggregateFunctionWindowFunnelData, AggregateFunctionWindowFunnel>
++        : public IAggregateFunctionDataHelper<AggregateFunctionWindowFunnelData, AggregateFunctionWindowFunnel<repeated>>
+ {
+ private:
+     UInt32 window;
+@@ -183,7 +184,7 @@ private:
+ public:
+     String getName() const override
+     {
+-        return "windowFunnel";
++        return !repeated ? "windowFunnel" : "windowRepeatedFunnel";
+     }
+ 
+     AggregateFunctionWindowFunnel(const DataTypes & arguments, const Array & params)
+@@ -191,7 +192,7 @@ public:
+         const auto time_arg = arguments.front().get();
+         if (!WhichDataType(time_arg).isDateTime() && !WhichDataType(time_arg).isUInt32())
+             throw Exception{"Illegal type " + time_arg->getName() + " of first argument of aggregate function " + getName()
+-                + ", must be DateTime or UInt32"};
++                    + ", must be DateTime or UInt32"};
+ 
+         for (const auto i : ext::range(1, arguments.size()))
+         {
+@@ -199,7 +200,7 @@ public:
+             if (!isUInt8(cond_arg))
+                 throw Exception{"Illegal type " + cond_arg->getName() + " of argument " + toString(i + 1) + " of aggregate function "
+                         + getName() + ", must be UInt8",
+-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
++                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
+         }
+ 
+         events_size = arguments.size() - 1;
+@@ -214,14 +215,30 @@ public:
+ 
+     void add(AggregateDataPtr place, const IColumn ** columns, const size_t row_num, Arena *) const override
+     {
+-        const auto timestamp = static_cast<const ColumnVector<UInt32> *>(columns[0])->getData()[row_num];
+-        // reverse iteration and stable sorting are needed for events that are qualified by more than one condition.
+-        for (auto i = events_size; i > 0; --i)
++        if constexpr(!repeated)
+         {
+-            auto event = static_cast<const ColumnVector<UInt8> *>(columns[i])->getData()[row_num];
+-            if (event)
+-                this->data(place).add(timestamp, i);
++            for (const auto i : ext::range(1, events_size + 1))
++            {
++                auto event = static_cast<const ColumnVector<UInt8> *>(columns[i])->getData()[row_num];
++                if (event)
++                {
++                    this->data(place).add(static_cast<const ColumnVector<UInt32> *>(columns[0])->getData()[row_num], i);
++                    break;
++                }
++            }
++        }
++        else
++        {
++            for (size_t i = events_size; i >= 1; --i)
++            {
++                auto event = static_cast<const ColumnVector<UInt8> *>(columns[i])->getData()[row_num];
++                if (event)
++                {
++                    this->data(place).add(static_cast<const ColumnVector<UInt32> *>(columns[0])->getData()[row_num], i);
++                }
++            }
+         }
++
+     }
+ 
+     void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena *) const override
+diff --git a/dbms/src/AggregateFunctions/AggregateFunctionXFunnel.cpp b/dbms/src/AggregateFunctions/AggregateFunctionXFunnel.cpp
+new file mode 100644
+index 000000000..4ff3297ed
+--- /dev/null
++++ b/dbms/src/AggregateFunctions/AggregateFunctionXFunnel.cpp
+@@ -0,0 +1,36 @@
++#include <AggregateFunctions/AggregateFunctionFactory.h>
++#include <AggregateFunctions/AggregateFunctionXFunnel.h>
++#include <AggregateFunctions/Helpers.h>
++#include <AggregateFunctions/FactoryHelpers.h>
++
++
++namespace DB
++{
++
++namespace
++{
++
++template <bool repeated = false>
++AggregateFunctionPtr createAggregateFunctionXFunnel(const std::string & name, const DataTypes & arguments, const Array & params)
++{
++    if (params.size() < 3 || params.size() > 4)
++        throw Exception{"Aggregate function " + name + " requires 3 - 4 parameter.", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH};
++
++    if (arguments.size() < 2)
++        throw Exception("Aggregate function " + name + " requires one column array argument and at least one event condition.", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
++
++    if (arguments.size() > AggregateFunctionXFunnelData::max_events + 1)
++        throw Exception("Too many event arguments for aggregate function " + name, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
++
++    return std::make_shared<AggregateFunctionXFunnel<repeated>>(arguments, params);
++}
++
++}
++
++void registerAggregateFunctionXFunnel(AggregateFunctionFactory & factory)
++{
++    factory.registerFunction("xFunnel", createAggregateFunctionXFunnel<false>, AggregateFunctionFactory::CaseInsensitive);
++    factory.registerFunction("xRepeatedFunnel", createAggregateFunctionXFunnel<true>, AggregateFunctionFactory::CaseInsensitive);
++}
++
++}
+diff --git a/dbms/src/AggregateFunctions/AggregateFunctionXFunnel.h b/dbms/src/AggregateFunctions/AggregateFunctionXFunnel.h
+new file mode 100644
+index 000000000..f257a354a
+--- /dev/null
++++ b/dbms/src/AggregateFunctions/AggregateFunctionXFunnel.h
+@@ -0,0 +1,542 @@
++#pragma once
++
++#include <iostream>
++#include <sstream>
++#include <unordered_set>
++#include <Columns/ColumnArray.h>
++#include <Columns/ColumnTuple.h>
++#include <Columns/ColumnsNumber.h>
++#include <Common/ArenaAllocator.h>
++#include <Common/typeid_cast.h>
++#include <DataTypes/DataTypeArray.h>
++#include <DataTypes/DataTypeDateTime.h>
++#include <DataTypes/DataTypeTuple.h>
++#include <DataTypes/DataTypesNumber.h>
++#include <IO/ReadHelpers.h>
++#include <IO/WriteHelpers.h>
++
++#include <common/logger_useful.h>
++
++#include <Core/Field.h>
++#include <boost/algorithm/string/split.hpp>
++#include <ext/range.h>
++
++#include <AggregateFunctions/IAggregateFunction.h>
++
++namespace DB
++{
++namespace ErrorCodes
++{
++extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
++extern const int TOO_MANY_ARGUMENTS_FOR_FUNCTION;
++}
++
++struct TimestampEvent
++{
++    UInt32 timestamp;
++    UInt16 day;
++    Tuple tuple;
++    UInt8 event;
++
++    TimestampEvent(const UInt32 & timestamp_, const UInt16 & day_, Tuple & tuple_, const UInt8 & event_)
++        : timestamp{timestamp_}, day{day_}, tuple{std::move(tuple_)}, event{event_}
++    {
++    }
++};
++
++struct ComparePairFirst final
++{
++    bool operator()(const TimestampEvent & lhs, const TimestampEvent & rhs) const
++    {
++        return lhs.timestamp < rhs.timestamp;
++    }
++};
++
++
++static constexpr size_t bytes_on_stack = 4096;
++//using TimestampEvents = PODArray<TimestampEvent, bytes_on_stack>;
++using TimestampEvents = std::vector<TimestampEvent>;
++using validataFunc = std::function<bool(const Tuple & tuple, const Tuple & pre_tuple)>;
++using Comparator = ComparePairFirst;
++
++struct AggregateFunctionXFunnelData
++{
++    static constexpr auto max_events = 32;
++
++    bool sorted = true;
++    TimestampEvents events_list;
++
++
++    size_t size() const
++    {
++        return events_list.size();
++    }
++
++    void add(const UInt32 & timestamp, const UInt16 & day, Tuple & node, UInt8 event)
++    {
++        // Since most events should have already been sorted by timestamp.
++        if (sorted && events_list.size() > 0 && events_list.back().timestamp > timestamp)
++        {
++            sorted = false;
++        }
++        events_list.emplace_back(timestamp, day, node, event);
++    }
++
++    void merge(const AggregateFunctionXFunnelData & other)
++    {
++        const auto size = events_list.size();
++        //        events_list.insert(std::begin(other.events_list), std::end(other.events_list));
++        events_list.insert(events_list.end(), other.events_list.begin(), other.events_list.end());
++
++        /// either sort whole container or do so partially merging ranges afterwards
++        if (!sorted && !other.sorted)
++            std::stable_sort(std::begin(events_list), std::end(events_list), Comparator{});
++        else
++        {
++            const auto begin = std::begin(events_list);
++            const auto middle = std::next(begin, size);
++            const auto end = std::end(events_list);
++
++            if (!sorted)
++                std::stable_sort(begin, middle, Comparator{});
++
++            if (!other.sorted)
++                std::stable_sort(middle, end, Comparator{});
++
++            std::inplace_merge(begin, middle, end, Comparator{});
++        }
++
++        sorted = true;
++    }
++
++    void sort()
++    {
++        if (!sorted)
++        {
++            std::stable_sort(std::begin(events_list), std::end(events_list), Comparator{});
++            sorted = true;
++        }
++    }
++
++    void serialize(WriteBuffer & buf) const
++    {
++        writeBinary(sorted, buf);
++        writeBinary(events_list.size(), buf);
++
++        for (const auto & events : events_list)
++        {
++            writeBinary(events.timestamp, buf);
++            writeBinary(events.day, buf);
++            auto & tuple = events.tuple;
++            writeBinary(tuple, buf);
++            writeBinary(events.event, buf);
++        }
++    }
++
++    void deserialize(ReadBuffer & buf)
++    {
++        readBinary(sorted, buf);
++
++        size_t size;
++        readBinary(size, buf);
++
++        /// TODO Protection against huge size
++
++        events_list.clear();
++        events_list.reserve(size);
++
++        UInt32 timestamp;
++        UInt16 day;
++        UInt8 event;
++
++        for (size_t i = 0; i < size; ++i)
++        {
++            readBinary(timestamp, buf);
++            readBinary(day, buf);
++
++            Tuple node;
++            readTuple(node, buf);
++
++            readBinary(event, buf);
++            events_list.emplace_back(timestamp, day, node, event);
++        }
++    }
++};
++
++
++/** Calculates the max event level in a sliding window.
++  * The max size of events is 32, that's enough for funnel analytics
++  * repeated indicates is there any repeated conditions, default to false
++  * Usage:
++  * - xFunnel(windowSize, 2, rule)( (timestamp, col1, col2....) , cond1, cond2, cond3, ....)
++  */
++template <bool repeated = false>
++class AggregateFunctionXFunnel final : public IAggregateFunctionDataHelper<AggregateFunctionXFunnelData, AggregateFunctionXFunnel<repeated>>
++{
++private:
++    UInt32 window;
++    UInt8 events_size;
++    UInt8 max_output_idx;
++    String rule_arg{""};
++    size_t tuple_size;
++
++    DataTypes dataTypes;
++
++    using validataIdxFuncs = std::vector<std::pair<UInt8, validataFunc>>;
++    std::vector<validataIdxFuncs> validators;
++
++    using Indexs = std::vector<UInt16>;
++    using DayIndexs = std::vector<Indexs>;
++
++    // 多维数组，第一维度表示某天开头的所有可能事件流序列
++    using DayIndexsPattern = std::vector<std::vector<DayIndexs>>;
++
++    /// 匹配算法
++    ALWAYS_INLINE DayIndexs getFunnelIndexArray(const AggregateFunctionXFunnelData & data) const
++    {
++        if (data.size() == 0)
++            return {};
++
++        const_cast<AggregateFunctionXFunnelData &>(data).sort();
++
++        // 返回多个漏斗匹配事件流，按天分组
++        UInt16 first_day = data.events_list.front().day;
++        int count = data.events_list.back().day - first_day + 1;
++        DayIndexs res(count);
++        DayIndexsPattern patterns(count, std::vector<DayIndexs>(events_size));
++
++//        LOG_TRACE(&Logger::get("xFunnel"), "list=>" << data.events_list.size() <<  ",day_size" << count << "~" << "min=>" << first_day << "max=>" <<  data.events_list.back().day);
++
++
++        bool ok;
++        int tmp_idx;
++
++        /// let's fuck the BT rules
++        /// 最大目标一样的， 从右边开始，越靠近最大目标的
++        /// 类似多叉树， 没满足最后目标求最大深度最右节点序列， 满足最后目标后，只需要第一个
++
++        for (UInt16 idx = 0; idx < data.events_list.size(); idx++)
++        {
++            const auto & event = data.events_list[idx];
++            const auto & timestamp = event.timestamp;
++            const auto & tuple = event.tuple;
++            const auto & event_idx = event.event;
++            const auto & day = event.day;
++
++
++            if (event_idx == 0)
++            {
++                if (!res[day - first_day].empty())
++                {
++                    continue;
++                }
++                Indexs tmp = Indexs{idx};
++                patterns[day - first_day][0].push_back(std::move(tmp));
++            }
++
++            else
++            {
++                for (UInt16 day_idx = 0; day_idx < patterns.size(); ++day_idx)
++                {
++                    if (!res[day_idx].empty() || day < first_day + day_idx)
++                        continue;
++
++                    //tmp_idx 表示 该天 event_idx = 0 的时间最大值，如果这个值也不满足时间窗口，则我们可以取多叉树最右值
++                    tmp_idx = patterns[day_idx].front().empty() ? -1 : patterns[day_idx].front().back().front();
++                    if (tmp_idx != -1 && data.events_list[tmp_idx].timestamp + window < timestamp)
++                    {
++                        for (size_t event = events_size - 1; event > 0; --event)
++                        {
++                            if (!patterns[day_idx][event - 1].empty())
++                            {
++                                res[day_idx] = patterns[day_idx][event - 1].back();
++                                count --;
++                                break;
++                            }
++                        }
++                        continue;
++                    }
++
++                    for (const auto & pre_indexes : patterns[day_idx][event_idx - 1])
++                    {
++                        if (pre_indexes.size() < 1)
++                            break;
++
++                        tmp_idx = pre_indexes.front();
++                        if (data.events_list[tmp_idx].timestamp + window >= timestamp)
++                        {
++                            ok = true;
++
++                            const auto & idx_funcs = validators[event_idx];
++                            for (const auto & idxFunc : idx_funcs)
++                            {
++                                const auto & pre_tuple = data.events_list[pre_indexes[idxFunc.first]].tuple;
++                                if (!idxFunc.second(tuple, pre_tuple))
++                                {
++                                    ok = false;
++                                    break;
++                                }
++                            }
++
++                            if (ok)
++                            {
++                                //如果是最后一个，只需要取最后一个！！
++                                Indexs current_indexes = pre_indexes;
++                                current_indexes.push_back(idx);
++                                patterns[day_idx][event_idx].push_back(std::move(current_indexes));
++                            }
++                        }
++                    }
++                    /// now we reach the final goal~ but we should continue ...
++                    if (event_idx + 1 == events_size && res[day_idx].empty() && !patterns[day_idx][event_idx].empty())
++                    {
++                        res[day_idx] = patterns[day_idx][event_idx].back();
++                        count--;
++                    }
++                }
++            }
++        }
++
++
++        /// for the days never reach final goal, let's gather them all.
++        if (count != 0)
++        {
++            for (UInt16 day_idx = 0; day_idx < patterns.size(); ++day_idx)
++            {
++                if (!res[day_idx].empty())
++                    continue;
++
++                /// return the rightest event sequences
++                for (size_t event = events_size - 1; event > 0; --event)
++                {
++                    if (!patterns[day_idx][event - 1].empty()) {
++                        res[day_idx] = patterns[day_idx][event - 1].back();
++//                        LOG_TRACE(&Logger::get("xFunnel"), "filling=> " << day_idx << "size=>" << res[day_idx].size());
++                        break;
++                    }
++                }
++            }
++        }
++        return std::move(res);
++    }
++
++public:
++    String getName() const override
++    {
++        return !repeated ? "xFunnel" : "xRepeatedFunnel";
++    }
++
++    AggregateFunctionXFunnel(const DataTypes & arguments, const Array & params)
++    {
++        window = params.at(0).safeGet<UInt64>();
++
++        // [min_ouput_idx, max_output_idx]
++        max_output_idx = params.at(1).safeGet<UInt64>() - 1;
++        if (max_output_idx < 1)
++            throw Exception{"Invalid number of " + toString(max_output_idx+1) + ", must greater than 2"};
++
++        const auto col_arg = arguments[0].get();
++        auto tuple_args = typeid_cast<const DataTypeTuple *>(col_arg);
++        if (!tuple_args)
++            throw Exception{
++            "Illegal type " + col_arg->getName() + " of first argument of aggregate function " + getName() + ", must be tuple"};
++        tuple_size = tuple_args->getElements().size();
++        events_size = arguments.size() - 1;
++        validators.resize(events_size);
++
++        for (const auto & i : ext::range(1, arguments.size()))
++        {
++            const auto & cond_arg = arguments[i].get();
++            if (!typeid_cast<const DataTypeUInt8 *>(cond_arg))
++                throw Exception{"Illegal type " + cond_arg->getName() + " of argument " + toString(i + 1) + " of aggregate function "
++                        + getName() + ", must be UInt8",
++                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
++        }
++
++        // (timestamp, day, a,b,c,d,...) ) =>  (timestamp, day, a) for max_output_idx == 3
++        const auto & tupleType = typeid_cast<const DataTypeTuple *>(arguments[0].get());
++        const auto & time_arg = static_cast<const DataTypeUInt32 *>(tupleType->getElements()[0].get());
++        if (!time_arg)
++            throw Exception{"Illegal type " + time_arg->getName() + " 1st of first tuple argument of aggregate function " + getName()
++                    + ", must be DateTime or UInt32"};
++
++        const auto & day_arg = static_cast<const DataTypeUInt16 *>(tupleType->getElements()[1].get());
++        if (!day_arg)
++            throw Exception{"Illegal type " + day_arg->getName() + " 2st of first tuple argument of aggregate function " + getName()
++                    + ", must be Date or UInt16"};
++
++
++        for (const auto & idx : ext::range(0, max_output_idx + 1))
++        {
++            dataTypes.emplace_back(tupleType->getElements()[idx]);
++        }
++
++        if (params.size() > 2)
++        {
++            rule_arg = params.at(2).safeGet<String>();
++            if (!rule_arg.empty())
++                initRule();
++        }
++        LOG_TRACE(&Logger::get("xFunnel"), "tuple_size " << tuple_size << " rule_args " << rule_arg << " window " << window);
++    }
++
++    // 初始化rule规则
++    ALWAYS_INLINE void initRule()
++    {
++        std::vector<String> ruleStrs;
++        // eg 1.1=2.1,3.2=2.2
++        boost::split(ruleStrs, rule_arg, [](char c) { return c == ','; });
++        if (ruleStrs.size() < 1)
++            return;
++
++        for (String & ruleStr : ruleStrs)
++        {
++            std::vector<String> ruleKvs;
++            boost::split(ruleKvs, ruleStr, [](char c) { return c == '='; });
++
++            // eg [1.1,2.2]
++            if (ruleKvs.size() != 2)
++                throw Exception{"Illegal rule " + ruleStr, ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
++
++            std::vector<String> ruleKeys;
++            std::vector<String> ruleValues;
++            boost::split(ruleKeys, ruleKvs[0], [](char c) { return c == '.'; });
++            boost::split(ruleValues, ruleKvs[1], [](char c) { return c == '.'; });
++
++            int previous_event_level = std::atoi(ruleKeys[0].c_str());
++            int previous_label_idx = std::atoi(ruleKeys[1].c_str());
++
++            int current_event_level = std::atoi(ruleValues[0].c_str());
++            int current_label_idx = std::atoi(ruleValues[1].c_str());
++
++            if (previous_event_level < current_event_level)
++            {
++                addRule(previous_event_level - 1, previous_label_idx - 3, current_event_level - 1, current_label_idx - 3);
++            }
++            else
++            {
++                addRule(current_event_level - 1, current_label_idx - 3, previous_event_level - 1, previous_label_idx - 3);
++            }
++        }
++    }
++
++    ALWAYS_INLINE void addRule(const size_t & previous_event_level,
++                               const size_t & previous_label_idx,
++                               const size_t & current_event_level,
++                               const size_t & current_label_idx)
++    {
++        auto func = [=](const Tuple & current_label, const Tuple & pre_label) {
++            const TupleBackend & current_arr = current_label.toUnderType();
++            const TupleBackend & previous_arr = pre_label.toUnderType();
++
++            return current_arr[current_label_idx] == previous_arr[previous_label_idx];
++        };
++        validators[current_event_level].push_back(std::make_pair(previous_event_level, func));
++    }
++
++    DataTypePtr getReturnType() const override
++    {
++        return std::make_shared<DataTypeArray>(std::make_shared<DataTypeArray>(std::make_shared<DataTypeTuple>(dataTypes)));
++    }
++
++    void add(AggregateDataPtr place, const IColumn ** columns, const size_t row_num, Arena *) const override
++    {
++        if constexpr (!repeated)
++        {
++            for (const auto idx : ext::range(1, events_size + 1))
++            {
++                auto event = static_cast<const ColumnVector<UInt8> *>(columns[idx])->getData()[row_num];
++                if (event)
++                {
++                    auto labelCol = static_cast<const ColumnTuple *>(columns[0]);
++
++                    /// 这里将timestamp和day抽离出来
++                    Tuple tuple = Tuple(TupleBackend(tuple_size - 2));
++                    auto & arr = tuple.toUnderType();
++                    for (const auto i : ext::range(2, tuple_size))
++                    {
++                        labelCol->getColumn(i).get(row_num, arr[i - 2]);
++                    }
++                    this->data(place).add(labelCol->getColumn(0).getInt(row_num), labelCol->getColumn(1).getInt(row_num), tuple, idx - 1);
++                    break;
++                }
++            }
++        }
++        else
++        {
++            for (auto idx = events_size; idx >= 1; --idx)
++            {
++                auto event = static_cast<const ColumnVector<UInt8> *>(columns[idx])->getData()[row_num];
++                if (event)
++                {
++                    auto labelCol = static_cast<const ColumnTuple *>(columns[0]);
++
++                    /// 这里将timestamp和day抽离出来
++                    Tuple tuple = Tuple(TupleBackend(tuple_size - 2));
++                    auto & arr = tuple.toUnderType();
++                    for (const auto i : ext::range(2, tuple_size))
++                    {
++                        labelCol->getColumn(i).get(row_num, arr[i - 2]);
++                    }
++                    this->data(place).add(labelCol->getColumn(0).getInt(row_num), labelCol->getColumn(1).getInt(row_num), tuple, idx - 1);
++                }
++            }
++        }
++    }
++
++    void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena *) const override
++    {
++        this->data(place).merge(this->data(rhs));
++    }
++
++    void serialize(ConstAggregateDataPtr place, WriteBuffer & buf) const override
++    {
++        this->data(place).serialize(buf);
++    }
++
++    void deserialize(AggregateDataPtr place, ReadBuffer & buf, Arena *) const override
++    {
++        this->data(place).deserialize(buf);
++    }
++
++    void insertResultInto(ConstAggregateDataPtr place, IColumn & to) const override
++    {
++        const auto & funnel_index_array = getFunnelIndexArray(this->data(place));
++        ColumnArray & arr_to = static_cast<ColumnArray &>(to);
++        ColumnArray::Offsets & offsets_to = arr_to.getOffsets();
++
++        int count = funnel_index_array.size();
++        for (const auto & funnel_index : funnel_index_array)
++        {
++            if (funnel_index.empty())
++            {
++                count --;
++                continue;
++            }
++            //static_cast<ColumnUInt8 &>(static_cast<ColumnArray &>(to).getData()).getData();
++            auto & arr_tuple_to = static_cast<ColumnArray &>(arr_to.getData());
++            auto & offset_tuple_to = arr_tuple_to.getOffsets();
++
++            for (const auto & index : funnel_index)
++            {
++                auto & timestamp_event = this->data(place).events_list[index];
++                auto & tuple_data = static_cast<ColumnTuple &>(arr_tuple_to.getData());
++
++                tuple_data.getColumn(0).insert(static_cast<UInt64>(timestamp_event.timestamp));
++                tuple_data.getColumn(1).insert(static_cast<UInt64>(timestamp_event.day));
++                for (size_t idx = 2; idx <= max_output_idx; idx++)
++                {
++                    tuple_data.getColumn(idx).insert(timestamp_event.tuple.toUnderType()[idx - 2]);
++                }
++            }
++            offset_tuple_to.push_back(offset_tuple_to.size() == 0 ? funnel_index.size() : offset_tuple_to.back() + funnel_index.size());
++        }
++        offsets_to.push_back(offsets_to.size() == 0 ? count : offsets_to.back() + count);
++    }
++
++    const char * getHeaderFilePath() const override
++    {
++        return __FILE__;
++    }
++};
++}
+diff --git a/dbms/src/AggregateFunctions/QuantileExact.h b/dbms/src/AggregateFunctions/QuantileExact.h
+index 7ac639b8f..57c93f98f 100644
+--- a/dbms/src/AggregateFunctions/QuantileExact.h
++++ b/dbms/src/AggregateFunctions/QuantileExact.h
+@@ -70,11 +70,19 @@ struct QuantileExact
+         if (!array.empty())
+         {
+             size_t n = level < 1
+-                ? level * array.size()
+-                : (array.size() - 1);
++                       ? level * array.size()
++                       : (array.size() - 1);
+ 
+             std::nth_element(array.begin(), array.begin() + n, array.end());    /// NOTE You can think of the radix-select algorithm.
+-            return array[n];
++
++            //TODO https://stackoverflow.com/questions/1719070/what-is-the-right-approach-when-using-stl-container-for-median-calculation
++            // some hacks
++            auto med = array[n];
++            if (!(array.size() & 1) && level == 0.5) {
++                auto max_it = std::max_element(array.begin(), array.begin()+n);
++                return (*max_it + med) / 2.0;
++            }
++            return med;
+         }
+ 
+         return std::numeric_limits<Value>::quiet_NaN();
+diff --git a/dbms/src/AggregateFunctions/registerAggregateFunctions.cpp b/dbms/src/AggregateFunctions/registerAggregateFunctions.cpp
+index 3517ad57a..bd7ffff70 100644
+--- a/dbms/src/AggregateFunctions/registerAggregateFunctions.cpp
++++ b/dbms/src/AggregateFunctions/registerAggregateFunctions.cpp
+@@ -15,6 +15,7 @@ void registerAggregateFunctionGroupArrayInsertAt(AggregateFunctionFactory &);
+ void registerAggregateFunctionsQuantile(AggregateFunctionFactory &);
+ void registerAggregateFunctionsSequenceMatch(AggregateFunctionFactory &);
+ void registerAggregateFunctionWindowFunnel(AggregateFunctionFactory &);
++void registerAggregateFunctionXFunnel(AggregateFunctionFactory &);
+ void registerAggregateFunctionsMinMaxAny(AggregateFunctionFactory &);
+ void registerAggregateFunctionsStatisticsStable(AggregateFunctionFactory &);
+ void registerAggregateFunctionsStatisticsSimple(AggregateFunctionFactory &);
+@@ -49,6 +50,7 @@ void registerAggregateFunctions()
+         registerAggregateFunctionsQuantile(factory);
+         registerAggregateFunctionsSequenceMatch(factory);
+         registerAggregateFunctionWindowFunnel(factory);
++        registerAggregateFunctionXFunnel(factory);
+         registerAggregateFunctionsMinMaxAny(factory);
+         registerAggregateFunctionsStatisticsStable(factory);
+         registerAggregateFunctionsStatisticsSimple(factory);
+diff --git a/dbms/src/CMakeLists.txt b/dbms/src/CMakeLists.txt
+index 30bd7c134..a9ccdb559 100644
+--- a/dbms/src/CMakeLists.txt
++++ b/dbms/src/CMakeLists.txt
+@@ -14,3 +14,4 @@ add_subdirectory (Client)
+ add_subdirectory (TableFunctions)
+ add_subdirectory (Analyzers)
+ add_subdirectory (Formats)
++add_subdirectory (Compression)
+diff --git a/dbms/src/Common/ErrorCodes.cpp b/dbms/src/Common/ErrorCodes.cpp
+index 4e724c995..7dd03459c 100644
+--- a/dbms/src/Common/ErrorCodes.cpp
++++ b/dbms/src/Common/ErrorCodes.cpp
+@@ -396,6 +396,8 @@ namespace ErrorCodes
+     extern const int MULTIPLE_ASSIGNMENTS_TO_COLUMN = 419;
+     extern const int CANNOT_UPDATE_COLUMN = 420;
+     extern const int CANNOT_ADD_DIFFERENT_AGGREGATE_STATES = 421;
++    extern const int ILLEGAL_SYNTAX_FOR_CODEC_TYPE = 422;
++    extern const int UNKNOWN_CODEC = 423;
+ 
+     extern const int KEEPER_EXCEPTION = 999;
+     extern const int POCO_EXCEPTION = 1000;
+diff --git a/dbms/src/Compression/CMakeLists.txt b/dbms/src/Compression/CMakeLists.txt
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/dbms/src/Compression/CompressionCodecLZ4.cpp b/dbms/src/Compression/CompressionCodecLZ4.cpp
+new file mode 100644
+index 000000000..610b81a69
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecLZ4.cpp
+@@ -0,0 +1,50 @@
++#include <Compression/CompressionCodecLZ4.h>
++#include <lz4.h>
++#include <lz4hc.h>
++#include <IO/CompressedStream.h>
++#include <Compression/CompressionFactory.h>
++#include "CompressionCodecLZ4.h"
++
++
++namespace DB
++{
++
++char CompressionCodecLZ4::getMethodByte()
++{
++    return static_cast<char>(CompressionMethodByte::LZ4);
++}
++
++void CompressionCodecLZ4::getCodecDesc(String & codec_desc)
++{
++    codec_desc = "LZ4";
++}
++
++void CompressionCodecLZ4::compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size)
++{
++    static constexpr size_t header_size = 1 + sizeof(UInt32) + sizeof(UInt32);
++
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wold-style-cast"
++    compressed_buf.resize(header_size + LZ4_COMPRESSBOUND(uncompressed_size));
++#pragma GCC diagnostic pop
++
++    compressed_size = header_size + LZ4_compress_default(
++        uncompressed_buf,
++        &compressed_buf[header_size],
++        uncompressed_size,
++        LZ4_COMPRESSBOUND(uncompressed_size));
++
++    UInt32 compressed_size_32 = compressed_size;
++    UInt32 uncompressed_size_32 = uncompressed_size;
++    unalignedStore(&compressed_buf[1], compressed_size_32);
++    unalignedStore(&compressed_buf[5], uncompressed_size_32);
++}
++
++void registerCodecLZ4(CompressionCodecFactory & factory)
++{
++    factory.registerSimpleCompressionCodec("LZ4", static_cast<char>(CompressionMethodByte::LZ4), [&](){
++        return std::make_shared<CompressionCodecLZ4>();
++    });
++}
++
++}
+diff --git a/dbms/src/Compression/CompressionCodecLZ4.h b/dbms/src/Compression/CompressionCodecLZ4.h
+new file mode 100644
+index 000000000..9ba8da3c3
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecLZ4.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <IO/WriteBuffer.h>
++#include <Compression/ICompressionCodec.h>
++#include <IO/BufferWithOwnMemory.h>
++#include <Parsers/StringRange.h>
++
++namespace DB
++{
++
++class CompressionCodecLZ4 : public ICompressionCodec
++{
++public:
++    char getMethodByte() override;
++
++    void getCodecDesc(String & codec_desc) override;
++
++    void compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size) override;
++};
++
++}
+\ No newline at end of file
+diff --git a/dbms/src/Compression/CompressionCodecMultiple.cpp b/dbms/src/Compression/CompressionCodecMultiple.cpp
+new file mode 100644
+index 000000000..b866aebbc
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecMultiple.cpp
+@@ -0,0 +1,50 @@
++#include <Compression/CompressionCodecMultiple.h>
++#include <IO/CompressedStream.h>
++#include "CompressionCodecMultiple.h"
++
++
++namespace DB
++{
++
++CompressionCodecMultiple::CompressionCodecMultiple(Codecs codecs)
++    : codecs(codecs)
++{
++    /// TODO initialize inner_methods_code
++    for (size_t idx = 0; idx < codecs.size(); idx++)
++    {
++        if (idx != 0)
++            codec_desc = codec_desc + ',';
++
++        const auto codec = codecs[idx];
++        String inner_codec_desc;
++        codec->getCodecDesc(inner_codec_desc);
++        codec_desc = codec_desc + inner_codec_desc;
++    }
++}
++
++char CompressionCodecMultiple::getMethodByte()
++{
++    return static_cast<char>(CompressionMethodByte::Multiple);
++}
++
++void CompressionCodecMultiple::getCodecDesc(String & codec_desc_)
++{
++    codec_desc_ = codec_desc;
++}
++
++void CompressionCodecMultiple::compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size)
++{
++    char reserve = 1;
++
++    PODArray<char> un_compressed_buf(uncompressed_size);
++    un_compressed_buf.emplace_back(reserve);
++    un_compressed_buf.insert(uncompressed_buf, uncompressed_buf + uncompressed_size);
++
++    for (auto & codec : codecs)
++    {
++        codec->compress(&un_compressed_buf[1], uncompressed_size, compressed_buf, compressed_size);
++        uncompressed_size = compressed_size;
++        compressed_buf.swap(un_compressed_buf);
++    }
++}
++}
+\ No newline at end of file
+diff --git a/dbms/src/Compression/CompressionCodecMultiple.h b/dbms/src/Compression/CompressionCodecMultiple.h
+new file mode 100644
+index 000000000..2fc0aef2e
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecMultiple.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <Compression/ICompressionCodec.h>
++
++namespace DB
++{
++
++class CompressionCodecMultiple final : public ICompressionCodec
++{
++public:
++    CompressionCodecMultiple(Codecs codecs);
++
++    char getMethodByte() override;
++
++    void getCodecDesc(String & codec_desc) override;
++
++    void compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size) override;
++
++private:
++    Codecs codecs;
++    String codec_desc;
++
++};
++
++}
+diff --git a/dbms/src/Compression/CompressionCodecNone.cpp b/dbms/src/Compression/CompressionCodecNone.cpp
+new file mode 100644
+index 000000000..49e4e4f01
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecNone.cpp
+@@ -0,0 +1,41 @@
++#include <Compression/CompressionCodecNone.h>
++#include <IO/CompressedStream.h>
++#include <Compression/CompressionFactory.h>
++
++
++namespace DB
++{
++
++char CompressionCodecNone::getMethodByte()
++{
++    return static_cast<char>(CompressionMethodByte::NONE);
++}
++
++void CompressionCodecNone::getCodecDesc(String & codec_desc)
++{
++    codec_desc = "NONE";
++}
++
++void CompressionCodecNone::compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size)
++{
++    static constexpr size_t header_size = 1 + sizeof(UInt32) + sizeof(UInt32);
++
++    compressed_size = header_size + uncompressed_size;
++    UInt32 uncompressed_size_32 = uncompressed_size;
++    UInt32 compressed_size_32 = compressed_size;
++
++    compressed_buf.resize(compressed_size);
++
++    unalignedStore(&compressed_buf[1], compressed_size_32);
++    unalignedStore(&compressed_buf[5], uncompressed_size_32);
++    memcpy(&compressed_buf[header_size], uncompressed_buf, uncompressed_size);
++}
++
++void registerCodecNone(CompressionCodecFactory & factory)
++{
++    factory.registerSimpleCompressionCodec("NONE", static_cast<char>(CompressionMethodByte::NONE), [&](){
++        return std::make_shared<CompressionCodecNone>();
++    });
++}
++
++}
+\ No newline at end of file
+diff --git a/dbms/src/Compression/CompressionCodecNone.h b/dbms/src/Compression/CompressionCodecNone.h
+new file mode 100644
+index 000000000..7cc205139
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecNone.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <IO/WriteBuffer.h>
++#include <Compression/ICompressionCodec.h>
++#include <IO/BufferWithOwnMemory.h>
++#include <Parsers/StringRange.h>
++
++namespace DB
++{
++
++class CompressionCodecNone : public ICompressionCodec
++{
++public:
++    char getMethodByte() override;
++
++    void getCodecDesc(String & codec_desc) override;
++
++    void compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size) override;
++};
++
++}
+\ No newline at end of file
+diff --git a/dbms/src/Compression/CompressionCodecZSTD.cpp b/dbms/src/Compression/CompressionCodecZSTD.cpp
+new file mode 100644
+index 000000000..7509d4eb6
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecZSTD.cpp
+@@ -0,0 +1,76 @@
++#include <Compression/CompressionCodecZSTD.h>
++#include <IO/CompressedStream.h>
++#include <Compression/CompressionFactory.h>
++#include <zstd.h>
++#include <Core/Field.h>
++#include <Parsers/IAST.h>
++#include <Parsers/ASTLiteral.h>
++#include <Common/typeid_cast.h>
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int CANNOT_COMPRESS;
++}
++
++char CompressionCodecZSTD::getMethodByte()
++{
++    return static_cast<char>(CompressionMethodByte::ZSTD);
++}
++
++void CompressionCodecZSTD::getCodecDesc(String & codec_desc)
++{
++    codec_desc = "ZSTD";
++}
++
++void CompressionCodecZSTD::compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size)
++{
++    static constexpr size_t header_size = 1 + sizeof(UInt32) + sizeof(UInt32);
++
++    compressed_buf.resize(header_size + ZSTD_compressBound(uncompressed_size));
++
++    size_t res = ZSTD_compress(
++        &compressed_buf[header_size],
++        compressed_buf.size() - header_size,
++        uncompressed_buf,
++        uncompressed_size,
++        level);
++
++    if (ZSTD_isError(res))
++        throw Exception("Cannot compress block with ZSTD: " + std::string(ZSTD_getErrorName(res)), ErrorCodes::CANNOT_COMPRESS);
++
++    compressed_size = header_size + res;
++
++    UInt32 compressed_size_32 = compressed_size;
++    UInt32 uncompressed_size_32 = uncompressed_size;
++
++    unalignedStore(&compressed_buf[1], compressed_size_32);
++    unalignedStore(&compressed_buf[5], uncompressed_size_32);
++}
++
++CompressionCodecZSTD::CompressionCodecZSTD(int level)
++    :level(level)
++{
++}
++
++void registerCodecZSTD(CompressionCodecFactory & factory)
++{
++    UInt8 method_code = static_cast<char>(CompressionMethodByte::ZSTD);
++    factory.registerCompressionCodec("ZSTD", method_code, [&](const ASTPtr & arguments) -> CompressionCodecPtr
++    {
++        int level = 0;
++        if (arguments && !arguments->children.empty())
++        {
++            const auto children = arguments->children;
++            const ASTLiteral * literal = static_cast<const ASTLiteral *>(children[0].get());
++            level = literal->value.safeGet<UInt64>();
++        }
++
++        return std::make_shared<CompressionCodecZSTD>(level);
++    });
++}
++
++}
+diff --git a/dbms/src/Compression/CompressionCodecZSTD.h b/dbms/src/Compression/CompressionCodecZSTD.h
+new file mode 100644
+index 000000000..65a43be64
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecZSTD.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <IO/WriteBuffer.h>
++#include <Compression/ICompressionCodec.h>
++#include <IO/BufferWithOwnMemory.h>
++#include <Parsers/StringRange.h>
++
++namespace DB
++{
++
++class CompressionCodecZSTD : public ICompressionCodec
++{
++public:
++    CompressionCodecZSTD(int level);
++
++    char getMethodByte() override;
++
++    void getCodecDesc(String & codec_desc) override;
++
++    void compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size) override;
++
++private:
++    int level;
++};
++
++}
+\ No newline at end of file
+diff --git a/dbms/src/Compression/CompressionFactory.cpp b/dbms/src/Compression/CompressionFactory.cpp
+new file mode 100644
+index 000000000..9d10b54b0
+--- /dev/null
++++ b/dbms/src/Compression/CompressionFactory.cpp
+@@ -0,0 +1,110 @@
++#include <Compression/CompressionFactory.h>
++#include <Parsers/parseQuery.h>
++#include <Parsers/ParserCreateQuery.h>
++#include <Parsers/ASTFunction.h>
++#include <Parsers/ASTIdentifier.h>
++#include <Parsers/ASTLiteral.h>
++#include <Common/typeid_cast.h>
++#include <Poco/String.h>
++#include <IO/ReadBuffer.h>
++#include <Parsers/queryToString.h>
++#include <Compression/CompressionCodecMultiple.h>
++#include <Compression/CompressionCodecLZ4.h>
++#include <Compression/CompressionCodecNone.h>
++
++namespace DB
++{
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++    extern const int ILLEGAL_SYNTAX_FOR_CODEC_TYPE;
++    extern const int UNEXPECTED_AST_STRUCTURE;
++    extern const int UNKNOWN_CODEC;
++    extern const int DATA_TYPE_CANNOT_HAVE_ARGUMENTS;
++}
++
++CompressionCodecPtr CompressionCodecFactory::getDefaultCodec() const
++{
++    return default_codec;
++}
++
++CompressionCodecPtr CompressionCodecFactory::get(const ASTPtr & ast) const
++{
++    if (const auto * func = typeid_cast<const ASTFunction *>(ast.get()))
++    {
++        if (func->parameters)
++            throw Exception("Compression codec cannot have multiple parenthesed parameters.", ErrorCodes::ILLEGAL_SYNTAX_FOR_CODEC_TYPE);
++
++        if (Poco::toLower(func->name) != "codec")
++            throw Exception("", ErrorCodes::UNKNOWN_CODEC);
++
++        Codecs codecs;
++        codecs.reserve(func->arguments->children.size());
++        for (const auto & inner_codec_ast : func->arguments->children)
++        {
++            if (const auto * family_name = typeid_cast<const ASTIdentifier *>(inner_codec_ast.get()))
++                codecs.emplace_back(getImpl(family_name->name, {}));
++            else if (const auto * ast_func = typeid_cast<const ASTFunction *>(inner_codec_ast.get()))
++                codecs.emplace_back(getImpl(ast_func->name, ast_func->arguments));
++            else
++                throw Exception("Unexpected AST element for compression codec.", ErrorCodes::UNEXPECTED_AST_STRUCTURE);
++        }
++
++        if (codecs.size() == 1)
++            return codecs.back();
++        else if (codecs.size() > 1)
++            return std::make_shared<CompressionCodecMultiple>(codecs);
++    }
++
++    throw Exception("Unknown codec expression : " + queryToString(ast), ErrorCodes::UNKNOWN_CODEC);
++}
++
++CompressionCodecPtr CompressionCodecFactory::getImpl(const String & family_name, const ASTPtr & arguments) const
++{
++    const auto family_and_creator = family_name_with_codec.find(family_name);
++
++    if (family_and_creator == family_name_with_codec.end())
++        throw Exception("Unknown codec family: " + family_name, ErrorCodes::UNKNOWN_CODEC);
++
++    return family_and_creator->second(arguments);
++}
++
++void CompressionCodecFactory::registerCompressionCodec(const String & family_name, UInt8 byte_code, Creator creator)
++{
++    if (creator == nullptr)
++        throw Exception("CompressionCodecFactory: the codec family " + family_name + " has been provided a null constructor",
++                        ErrorCodes::LOGICAL_ERROR);
++
++    if (!family_name_with_codec.emplace(family_name, creator).second)
++        throw Exception("CompressionCodecFactory: the codec family name '" + family_name + "' is not unique", ErrorCodes::LOGICAL_ERROR);
++
++    if (!family_code_with_codec.emplace(byte_code, creator).second)
++        throw Exception("CompressionCodecFactory: the codec family name '" + family_name + "' is not unique", ErrorCodes::LOGICAL_ERROR);
++}
++
++void CompressionCodecFactory::registerSimpleCompressionCodec(const String & family_name, UInt8 byte_code,
++                                                                 std::function<CompressionCodecPtr()> creator)
++{
++    registerCompressionCodec(family_name, byte_code, [family_name, creator](const ASTPtr & ast)
++    {
++        if (ast)
++            throw Exception("Data type " + family_name + " cannot have arguments", ErrorCodes::DATA_TYPE_CANNOT_HAVE_ARGUMENTS);
++        return creator();
++    });
++}
++
++void registerCodecLZ4(CompressionCodecFactory & factory);
++void registerCodecNone(CompressionCodecFactory & factory);
++void registerCodecZSTD(CompressionCodecFactory & factory);
++//void registerCodecDelta(CompressionCodecFactory & factory);
++
++CompressionCodecFactory::CompressionCodecFactory()
++{
++    default_codec = std::make_shared<CompressionCodecLZ4>();
++    registerCodecLZ4(*this);
++    registerCodecNone(*this);
++    registerCodecZSTD(*this);
++//    registerCodecDelta(*this);
++}
++
++}
+\ No newline at end of file
+diff --git a/dbms/src/Compression/CompressionFactory.h b/dbms/src/Compression/CompressionFactory.h
+new file mode 100644
+index 000000000..ecc03053c
+--- /dev/null
++++ b/dbms/src/Compression/CompressionFactory.h
+@@ -0,0 +1,54 @@
++#pragma once
++
++#include <memory>
++#include <functional>
++#include <unordered_map>
++#include <ext/singleton.h>
++#include <Common/IFactoryWithAliases.h>
++#include <Compression/ICompressionCodec.h>
++#include <IO/CompressedStream.h>
++
++namespace DB
++{
++
++class ICompressionCodec;
++
++using CompressionCodecPtr = std::shared_ptr<ICompressionCodec>;
++
++class IAST;
++
++using ASTPtr = std::shared_ptr<IAST>;
++
++/** Creates a codec object by name of compression algorithm family and parameters.
++ */
++class CompressionCodecFactory final : public ext::singleton<CompressionCodecFactory>
++{
++protected:
++    using Creator = std::function<CompressionCodecPtr(const ASTPtr & parameters)>;
++    using SimpleCreator = std::function<CompressionCodecPtr()>;
++    using CompressionCodecsDictionary = std::unordered_map<String, Creator>;
++    using CompressionCodecsCodeDictionary = std::unordered_map<UInt8, Creator>;
++public:
++
++    CompressionCodecPtr getDefaultCodec() const;
++
++    CompressionCodecPtr get(const ASTPtr & ast) const;
++
++    void registerCompressionCodec(const String & family_name, UInt8 byte_code, Creator creator);
++
++    void registerSimpleCompressionCodec(const String & family_name, UInt8 byte_code, SimpleCreator creator);
++
++protected:
++    CompressionCodecPtr getImpl(const String & family_name, const ASTPtr & arguments) const;
++
++private:
++    CompressionCodecsDictionary family_name_with_codec;
++    CompressionCodecsCodeDictionary family_code_with_codec;
++    CompressionCodecPtr default_codec;
++
++    CompressionCodecFactory();
++
++    friend class ext::singleton<CompressionCodecFactory>;
++};
++
++}
+\ No newline at end of file
+diff --git a/dbms/src/Compression/ICompressionCodec.cpp b/dbms/src/Compression/ICompressionCodec.cpp
+new file mode 100644
+index 000000000..e4419ea28
+--- /dev/null
++++ b/dbms/src/Compression/ICompressionCodec.cpp
+@@ -0,0 +1,71 @@
++#include <Compression/ICompressionCodec.h>
++#include <IO/LZ4_decompress_faster.h>
++#include "ICompressionCodec.h"
++
++
++namespace DB
++{
++
++ReadBufferPtr ICompressionCodec::liftCompressed(ReadBuffer & origin)
++{
++    return std::make_shared<LazyLiftCompressedReadBuffer>(*this, origin);
++}
++
++WriteBufferPtr ICompressionCodec::liftCompressed(WriteBuffer & origin)
++{
++    return std::make_shared<LiftedCompressedWriteBuffer>(*this, origin);
++}
++
++LazyLiftCompressedReadBuffer::LazyLiftCompressedReadBuffer(ICompressionCodec & /*codec*/, ReadBuffer & /*origin*/)
++{
++}
++
++bool LazyLiftCompressedReadBuffer::nextImpl()
++{
++//    size_t size_decompressed;
++//    size_t size_compressed_without_checksum;
++//    size_compressed = readCompressedData(size_decompressed, size_compressed_without_checksum);
++//    if (!size_compressed)
++//        return false;
++//
++//    memory.resize(size_decompressed + LZ4::ADDITIONAL_BYTES_AT_END_OF_BUFFER);
++//    working_buffer = Buffer(memory.data(), &memory[size_decompressed]);
++//
++//    decompress(working_buffer.begin(), size_decompressed, size_compressed_without_checksum);
++//
++    return true;
++}
++
++LiftedCompressedWriteBuffer::~LiftedCompressedWriteBuffer()
++{
++    try
++    {
++        next();
++    }
++    catch (...)
++    {
++        tryLogCurrentException(__PRETTY_FUNCTION__);
++    }
++}
++
++void LiftedCompressedWriteBuffer::nextImpl()
++{
++    if (!offset())
++        return;
++
++    size_t compressed_size = 0;
++    size_t uncompressed_size = offset();
++    compressed_buffer.emplace_back(compression_codec.getMethodByte());
++    compression_codec.compress(working_buffer.begin(), uncompressed_size, compressed_buffer, compressed_size);
++    CityHash_v1_0_2::uint128 checksum = CityHash_v1_0_2::CityHash128(compressed_buffer.data(), compressed_size);
++
++    out.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
++    out.write(compressed_buffer.data(), compressed_size);
++}
++
++LiftedCompressedWriteBuffer::LiftedCompressedWriteBuffer(ICompressionCodec & compression_codec, WriteBuffer & out, size_t buf_size)
++    : BufferWithOwnMemory<WriteBuffer>(buf_size), out(out), compression_codec(compression_codec)
++{
++}
++
++}
+diff --git a/dbms/src/Compression/ICompressionCodec.h b/dbms/src/Compression/ICompressionCodec.h
+new file mode 100644
+index 000000000..ea1818c65
+--- /dev/null
++++ b/dbms/src/Compression/ICompressionCodec.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include <memory>
++#include <Core/Field.h>
++#include <IO/ReadBuffer.h>
++#include <IO/WriteBuffer.h>
++#include <IO/BufferWithOwnMemory.h>
++#include <Common/PODArray.h>
++#include <DataTypes/IDataType.h>
++#include <boost/noncopyable.hpp>
++
++namespace DB
++{
++
++class ICompressionCodec;
++
++using CompressionCodecPtr = std::shared_ptr<ICompressionCodec>;
++using Codecs = std::vector<CompressionCodecPtr>;
++
++class LiftedCompressedWriteBuffer : public BufferWithOwnMemory<WriteBuffer>
++{
++public:
++    LiftedCompressedWriteBuffer(ICompressionCodec & compression_codec, WriteBuffer & out, size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE);
++
++    ~LiftedCompressedWriteBuffer() override;
++
++private:
++    void nextImpl() override;
++
++
++private:
++    WriteBuffer & out;
++    ICompressionCodec & compression_codec;
++    PODArray<char> compressed_buffer;
++};
++
++class LazyLiftCompressedReadBuffer : public BufferWithOwnMemory<ReadBuffer>
++{
++private:
++    bool nextImpl() override;
++public:
++    LazyLiftCompressedReadBuffer(ICompressionCodec & codec, ReadBuffer & origin);
++};
++
++/**
++*
++*/
++class ICompressionCodec : private boost::noncopyable
++{
++public:
++    virtual ~ICompressionCodec() = default;
++
++    ReadBufferPtr liftCompressed(ReadBuffer & origin);
++
++    WriteBufferPtr liftCompressed(WriteBuffer & origin);
++
++    virtual char getMethodByte() = 0;
++
++    virtual void getCodecDesc(String & codec_desc) = 0;
++
++    virtual void compress(char * uncompressed_buf, size_t uncompressed_size, PODArray<char> & compressed_buf, size_t & compressed_size) = 0;
++};
++
++}
+diff --git a/dbms/src/Core/Field.cpp b/dbms/src/Core/Field.cpp
+index 9a7fc60f4..b948a8340 100644
+--- a/dbms/src/Core/Field.cpp
++++ b/dbms/src/Core/Field.cpp
+@@ -142,7 +142,80 @@ namespace DB
+ 
+ namespace DB
+ {
+-    inline void readBinary(Tuple & x_def, ReadBuffer & buf)
++    //TODO inline
++    void readBinary(Tuple & x_def, ReadBuffer & buf)
++    {
++        auto & x = x_def.toUnderType();
++        size_t size;
++        DB::readBinary(size, buf);
++
++        for (size_t index = 0; index < size; ++index)
++        {
++            UInt8 type;
++            DB::readBinary(type, buf);
++
++            switch (type)
++            {
++                case Field::Types::Null:
++                {
++                    x.push_back(DB::Field());
++                    break;
++                }
++                case Field::Types::UInt64:
++                {
++                    UInt64 value;
++                    DB::readVarUInt(value, buf);
++                    x.push_back(value);
++                    break;
++                }
++                case Field::Types::UInt128:
++                {
++                    UInt128 value;
++                    DB::readBinary(value, buf);
++                    x.push_back(value);
++                    break;
++                }
++                case Field::Types::Int64:
++                {
++                    Int64 value;
++                    DB::readVarInt(value, buf);
++                    x.push_back(value);
++                    break;
++                }
++                case Field::Types::Float64:
++                {
++                    Float64 value;
++                    DB::readFloatBinary(value, buf);
++                    x.push_back(value);
++                    break;
++                }
++                case Field::Types::String:
++                {
++                    std::string value;
++                    DB::readStringBinary(value, buf);
++                    x.push_back(value);
++                    break;
++                }
++                case Field::Types::Array:
++                {
++                    Array value;
++                    DB::readBinary(value, buf);
++                    x.push_back(value);
++                    break;
++                }
++                case Field::Types::Tuple:
++                {
++                    Tuple value;
++                    DB::readBinary(value, buf);
++                    x.push_back(value);
++                    break;
++                }
++            };
++        }
++    }
++
++    void readTuple(Tuple & x_def, ReadBuffer & buf)
++
+     {
+         auto & x = x_def.toUnderType();
+         size_t size;
+diff --git a/dbms/src/Core/Field.h b/dbms/src/Core/Field.h
+index ca8bd2fb2..0b39e1a13 100644
+--- a/dbms/src/Core/Field.h
++++ b/dbms/src/Core/Field.h
+@@ -638,6 +638,7 @@ void writeText(const Array & x, WriteBuffer & buf);
+ inline void writeQuoted(const Array &, WriteBuffer &) { throw Exception("Cannot write Array quoted.", ErrorCodes::NOT_IMPLEMENTED); }
+ 
+ void readBinary(Tuple & x, ReadBuffer & buf);
++void readTuple(Tuple & x, ReadBuffer & buf);
+ 
+ inline void readText(Tuple &, ReadBuffer &) { throw Exception("Cannot read Tuple.", ErrorCodes::NOT_IMPLEMENTED); }
+ inline void readQuoted(Tuple &, ReadBuffer &) { throw Exception("Cannot read Tuple.", ErrorCodes::NOT_IMPLEMENTED); }
+diff --git a/dbms/src/IO/CompressedStream.h b/dbms/src/IO/CompressedStream.h
+index 5a00db020..be8fb254f 100644
+--- a/dbms/src/IO/CompressedStream.h
++++ b/dbms/src/IO/CompressedStream.h
+@@ -47,6 +47,7 @@ enum class CompressionMethodByte : uint8_t
+     NONE     = 0x02,
+     LZ4      = 0x82,
+     ZSTD     = 0x90,
++    Multiple = 0x91,
+ };
+ 
+ }
+diff --git a/dbms/src/Interpreters/InterpreterCreateQuery.cpp b/dbms/src/Interpreters/InterpreterCreateQuery.cpp
+index 69e7ae63a..5ee605c28 100644
+--- a/dbms/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -41,6 +41,8 @@
+ 
+ #include <Common/ZooKeeper/ZooKeeper.h>
+ 
++#include <Compression/CompressionFactory.h>
++
+ 
+ namespace DB
+ {
+@@ -167,13 +169,16 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
+ 
+ 
+ using ColumnsAndDefaults = std::pair<NamesAndTypesList, ColumnDefaults>;
++using ColumnDefaultsAndCodecs = std::pair<ColumnDefaults, ColumnCodecs>;
++using ColumnsDefaultsAndCodecs = std::pair<NamesAndTypesList, ColumnDefaultsAndCodecs>;
+ 
+ /// AST to the list of columns with types. Columns of Nested type are expanded into a list of real columns.
+-static ColumnsAndDefaults parseColumns(const ASTExpressionList & column_list_ast, const Context & context)
++static ColumnsDefaultsAndCodecs parseColumns(const ASTExpressionList & column_list_ast, const Context & context)
+ {
+     /// list of table columns in correct order
+     NamesAndTypesList columns{};
+     ColumnDefaults defaults{};
++    ColumnCodecs codecs{};
+ 
+     /// Columns requiring type-deduction or default_expression type-check
+     std::vector<std::pair<NameAndTypePair *, ASTColumnDeclaration *>> defaulted_columns{};
+@@ -217,6 +222,12 @@ static ColumnsAndDefaults parseColumns(const ASTExpressionList & column_list_ast
+             else
+                 default_expr_list->children.emplace_back(setAlias(col_decl.default_expression->clone(), col_decl.name));
+         }
++
++        if (col_decl.codec)
++        {
++            auto codec = CompressionCodecFactory::instance().get(col_decl.codec);
++            codecs.emplace(col_decl.name, codec);
++        }
+     }
+ 
+     /// set missing types and wrap default_expression's in a conversion-function if necessary
+@@ -266,14 +277,15 @@ static ColumnsAndDefaults parseColumns(const ASTExpressionList & column_list_ast
+         }
+     }
+ 
+-    return {Nested::flatten(columns), defaults};
++    return {Nested::flatten(columns), {defaults, codecs}};
+ }
+ 
+ 
+-static NamesAndTypesList removeAndReturnColumns(ColumnsAndDefaults & columns_and_defaults, const ColumnDefaultKind kind)
++static NamesAndTypesList removeAndReturnColumns(ColumnsDefaultsAndCodecs & columns_and_defaults_and_codecs, const ColumnDefaultKind kind)
+ {
+-    auto & columns = columns_and_defaults.first;
+-    auto & defaults = columns_and_defaults.second;
++    auto & columns = columns_and_defaults_and_codecs.first;
++    auto & defaults_and_codecs = columns_and_defaults_and_codecs.second;
++    auto & defaults = defaults_and_codecs.first;
+ 
+     NamesAndTypesList removed{};
+ 
+@@ -341,6 +353,18 @@ ASTPtr InterpreterCreateQuery::formatColumns(const ColumnsDescription & columns)
+             column_declaration->default_expression = it->second.expression->clone();
+         }
+ 
++        const auto ct = columns.codecs.find(column.name);
++        if (ct != std::end(columns.codecs))
++        {
++            String codec_desc;
++            ct->second->getCodecDesc(codec_desc);
++            codec_desc = "CODEC(" + codec_desc + ")";
++            auto pos = codec_desc.data();
++            const auto end = pos + codec_desc.size();
++            ParserIdentifierWithParameters codec_p;
++            column_declaration->codec = parseQuery(codec_p, pos, end, "column codec", 0);
++        }
++
+         columns_list->children.push_back(column_declaration_ptr);
+     }
+ 
+@@ -352,11 +376,12 @@ ColumnsDescription InterpreterCreateQuery::getColumnsDescription(const ASTExpres
+ {
+     ColumnsDescription res;
+ 
+-    auto && columns_and_defaults = parseColumns(columns, context);
+-    res.materialized = removeAndReturnColumns(columns_and_defaults, ColumnDefaultKind::Materialized);
+-    res.aliases = removeAndReturnColumns(columns_and_defaults, ColumnDefaultKind::Alias);
+-    res.ordinary = std::move(columns_and_defaults.first);
+-    res.defaults = std::move(columns_and_defaults.second);
++    auto && columns_and_defaults_and_codecs = parseColumns(columns, context);
++    res.materialized = removeAndReturnColumns(columns_and_defaults_and_codecs, ColumnDefaultKind::Materialized);
++    res.aliases = removeAndReturnColumns(columns_and_defaults_and_codecs, ColumnDefaultKind::Alias);
++    res.ordinary = std::move(columns_and_defaults_and_codecs.first);
++    res.defaults = std::move(columns_and_defaults_and_codecs.second.first);
++    res.codecs = std::move(columns_and_defaults_and_codecs.second.second);
+ 
+     if (res.ordinary.size() + res.materialized.size() == 0)
+         throw Exception{"Cannot CREATE table without physical columns", ErrorCodes::EMPTY_LIST_OF_COLUMNS_PASSED};
+diff --git a/dbms/src/Parsers/ASTColumnDeclaration.h b/dbms/src/Parsers/ASTColumnDeclaration.h
+index 308e9b665..cfe2650d7 100644
+--- a/dbms/src/Parsers/ASTColumnDeclaration.h
++++ b/dbms/src/Parsers/ASTColumnDeclaration.h
+@@ -15,6 +15,7 @@ public:
+     ASTPtr type;
+     String default_specifier;
+     ASTPtr default_expression;
++    ASTPtr codec;
+ 
+     String getID() const override { return "ColumnDeclaration_" + name; }
+ 
+@@ -29,6 +30,12 @@ public:
+             res->children.push_back(res->type);
+         }
+ 
++        if (codec)
++        {
++            res->codec=codec->clone();
++            res->children.push_back(res->codec);
++        }
++
+         if (default_expression)
+         {
+             res->default_expression = default_expression->clone();
+@@ -51,6 +58,12 @@ protected:
+             type->formatImpl(settings, state, frame);
+         }
+ 
++        if (codec)
++        {
++            settings.ostr << ' ';
++            codec->formatImpl(settings, state, frame);
++        }
++
+         if (default_expression)
+         {
+             settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << default_specifier << (settings.hilite ? hilite_none : "") << ' ';
+diff --git a/dbms/src/Parsers/ParserCreateQuery.h b/dbms/src/Parsers/ParserCreateQuery.h
+index 75ce5b805..411cc906e 100644
+--- a/dbms/src/Parsers/ParserCreateQuery.h
++++ b/dbms/src/Parsers/ParserCreateQuery.h
+@@ -98,6 +98,8 @@ class IParserColumnDeclaration : public IParserBase
+ protected:
+     const char * getName() const { return "column declaration"; }
+     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected);
++    bool isDeclareColumnType(Pos & pos, Expected & expected);
++    bool isDeclareColumnCodec(Pos & pos, Expected & expected);
+ };
+ 
+ using ParserColumnDeclaration = IParserColumnDeclaration<ParserIdentifier>;
+@@ -106,33 +108,26 @@ using ParserCompoundColumnDeclaration = IParserColumnDeclaration<ParserCompoundI
+ template <typename NameParser>
+ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+ {
++    ASTPtr column_name;
++    ASTPtr column_type;
++    ASTPtr column_codec;
+     NameParser name_parser;
+-    ParserIdentifierWithOptionalParameters type_parser;
++    ParserKeyword s_alias{"ALIAS"};
+     ParserKeyword s_default{"DEFAULT"};
+     ParserKeyword s_materialized{"MATERIALIZED"};
+-    ParserKeyword s_alias{"ALIAS"};
++    ParserIdentifierWithParameters codec_parser;
+     ParserTernaryOperatorExpression expr_parser;
++    ParserIdentifierWithOptionalParameters type_parser;
+ 
+-    /// mandatory column name
+-    ASTPtr name;
+-    if (!name_parser.parse(pos, name, expected))
++    if (!name_parser.parse(pos, column_name, expected))
+         return false;
+ 
+-    /** column name should be followed by type name if it
+-      *    is not immediately followed by {DEFAULT, MATERIALIZED, ALIAS}
+-      */
+-    ASTPtr type;
+-    const auto fallback_pos = pos;
+-    if (!s_default.check(pos, expected) &&
+-        !s_materialized.check(pos, expected) &&
+-        !s_alias.check(pos, expected))
+-    {
+-        type_parser.parse(pos, type, expected);
+-    }
+-    else
+-        pos = fallback_pos;
++    if (isDeclareColumnType(pos, expected))
++        type_parser.parse(pos, column_type, expected);
++
++    if (isDeclareColumnCodec(pos, expected))
++        codec_parser.parse(pos, column_codec, expected);
+ 
+-    /// parse {DEFAULT, MATERIALIZED, ALIAS}
+     String default_specifier;
+     ASTPtr default_expression;
+     Pos pos_before_specifier = pos;
+@@ -146,16 +141,21 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
+         if (!expr_parser.parse(pos, default_expression, expected))
+             return false;
+     }
+-    else if (!type)
+-        return false; /// reject sole column name without type
+ 
+     const auto column_declaration = std::make_shared<ASTColumnDeclaration>();
+-    node = column_declaration;
+-    column_declaration->name = typeid_cast<ASTIdentifier &>(*name).name;
+-    if (type)
++
++    column_declaration->name = typeid_cast<ASTIdentifier *>(column_name.get())->name;
++
++    if (column_type)
+     {
+-        column_declaration->type = type;
+-        column_declaration->children.push_back(std::move(type));
++        column_declaration->type = column_type;
++        column_declaration->children.push_back(std::move(column_type));
++    }
++
++    if (column_codec)
++    {
++        column_declaration->codec = column_codec;
++        column_declaration->children.push_back(std::move(column_codec));
+     }
+ 
+     if (default_expression)
+@@ -165,9 +165,26 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
+         column_declaration->children.push_back(std::move(default_expression));
+     }
+ 
++    node = column_declaration;
+     return true;
+ }
+ 
++template<typename NameParser>
++bool IParserColumnDeclaration<NameParser>::isDeclareColumnType(Pos & pos, Expected & expected)
++{
++    auto check_pos = pos;
++    return !ParserKeyword{"CODEC"}.check(check_pos, expected) &&
++           !ParserKeyword{"ALIAS"}.check(check_pos, expected) &&
++           !ParserKeyword{"DEFAULT"}.check(check_pos, expected) &&
++           !ParserKeyword{"MATERIALIZED"}.check(check_pos, expected);
++}
++template<typename NameParser>
++bool IParserColumnDeclaration<NameParser>::isDeclareColumnCodec(Pos & pos, Expected & expected)
++{
++    auto check_pos = pos;
++    return ParserKeyword{"CODEC"}.check(check_pos, expected);
++}
++
+ class ParserColumnDeclarationList : public IParserBase
+ {
+ protected:
+diff --git a/dbms/src/Storages/ColumnCodec.h b/dbms/src/Storages/ColumnCodec.h
+new file mode 100644
+index 000000000..63a604c81
+--- /dev/null
++++ b/dbms/src/Storages/ColumnCodec.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <string>
++#include <unordered_map>
++#include <Parsers/IAST.h>
++#include <Compression/ICompressionCodec.h>
++
++namespace DB
++{
++    using ColumnCodecs = std::unordered_map<std::string, CompressionCodecPtr>;
++}
+diff --git a/dbms/src/Storages/ColumnsDescription.cpp b/dbms/src/Storages/ColumnsDescription.cpp
+index cb67d01a4..28f30c69d 100644
+--- a/dbms/src/Storages/ColumnsDescription.cpp
++++ b/dbms/src/Storages/ColumnsDescription.cpp
+@@ -15,6 +15,7 @@
+ #include <ext/map.h>
+ 
+ #include <boost/range/join.hpp>
++#include <Compression/CompressionFactory.h>
+ 
+ 
+ namespace DB
+@@ -102,6 +103,15 @@ String ColumnsDescription::toString() const
+     return buf.str();
+ }
+ 
++CompressionCodecPtr ColumnsDescription::getCodec(const String & column_name) const
++{
++    const auto codec = codecs.find(column_name);
++
++    if (codec == codecs.end())
++        return CompressionCodecFactory::instance().getDefaultCodec();
++
++    return codec->second;
++}
+ 
+ ColumnsDescription ColumnsDescription::parse(const String & str)
+ {
+diff --git a/dbms/src/Storages/ColumnsDescription.h b/dbms/src/Storages/ColumnsDescription.h
+index 288d2712b..25358863e 100644
+--- a/dbms/src/Storages/ColumnsDescription.h
++++ b/dbms/src/Storages/ColumnsDescription.h
+@@ -4,6 +4,7 @@
+ #include <Core/Names.h>
+ #include <Storages/ColumnDefault.h>
+ #include <Core/Block.h>
++#include <Storages/ColumnCodec.h>
+ 
+ 
+ namespace DB
+@@ -15,6 +16,7 @@ struct ColumnsDescription
+     NamesAndTypesList materialized;
+     NamesAndTypesList aliases;
+     ColumnDefaults defaults;
++    ColumnCodecs codecs;
+ 
+     ColumnsDescription() = default;
+ 
+@@ -53,9 +55,10 @@ struct ColumnsDescription
+ 
+     bool hasPhysical(const String & column_name) const;
+ 
+-
+     String toString() const;
+ 
++    CompressionCodecPtr getCodec(const String & column_name) const;
++
+     static ColumnsDescription parse(const String & str);
+ };
+ 
+diff --git a/dbms/src/Storages/MergeTree/MergedBlockOutputStream.cpp b/dbms/src/Storages/MergeTree/MergedBlockOutputStream.cpp
+index 98de7b039..71de26e11 100644
+--- a/dbms/src/Storages/MergeTree/MergedBlockOutputStream.cpp
++++ b/dbms/src/Storages/MergeTree/MergedBlockOutputStream.cpp
+@@ -40,6 +40,7 @@ void IMergedBlockOutputStream::addStreams(
+     const String & path,
+     const String & name,
+     const IDataType & type,
++    const CompressionCodecPtr & codec,
+     size_t estimated_size,
+     bool skip_offsets)
+ {
+@@ -58,8 +59,8 @@ void IMergedBlockOutputStream::addStreams(
+             stream_name,
+             path + stream_name, DATA_FILE_EXTENSION,
+             path + stream_name, MARKS_FILE_EXTENSION,
++            codec,
+             max_compress_block_size,
+-            compression_settings,
+             estimated_size,
+             aio_threshold);
+     };
+@@ -182,15 +183,15 @@ IMergedBlockOutputStream::ColumnStream::ColumnStream(
+     const std::string & data_file_extension_,
+     const std::string & marks_path,
+     const std::string & marks_file_extension_,
++    const CompressionCodecPtr & compression_codec,
+     size_t max_compress_block_size,
+-    CompressionSettings compression_settings,
+     size_t estimated_size,
+     size_t aio_threshold) :
+     escaped_column_name(escaped_column_name_),
+     data_file_extension{data_file_extension_},
+     marks_file_extension{marks_file_extension_},
+     plain_file(createWriteBufferFromFileBase(data_path + data_file_extension, estimated_size, aio_threshold, max_compress_block_size)),
+-    plain_hashing(*plain_file), compressed_buf(plain_hashing, compression_settings), compressed(compressed_buf),
++    plain_hashing(*plain_file), compressed_buf(compression_codec->liftCompressed(plain_hashing)), compressed(*compressed_buf.get()),
+     marks_file(marks_path + marks_file_extension, 4096, O_TRUNC | O_CREAT | O_WRONLY), marks(marks_file)
+ {
+ }
+@@ -238,7 +239,10 @@ MergedBlockOutputStream::MergedBlockOutputStream(
+ {
+     init();
+     for (const auto & it : columns_list)
+-        addStreams(part_path, it.name, *it.type, 0, false);
++    {
++        const auto columns = storage.getColumns();
++        addStreams(part_path, it.name, *it.type, columns.getCodec(it.name), 0, false);
++    }
+ }
+ 
+ MergedBlockOutputStream::MergedBlockOutputStream(
+@@ -264,7 +268,9 @@ MergedBlockOutputStream::MergedBlockOutputStream(
+             if (it2 != merged_column_to_size_.end())
+                 estimated_size = it2->second;
+         }
+-        addStreams(part_path, it.name, *it.type, estimated_size, false);
++
++        const auto columns = storage.getColumns();
++        addStreams(part_path, it.name, *it.type, columns.getCodec(it.name), estimated_size, false);
+     }
+ }
+ 
+@@ -524,7 +530,8 @@ void MergedColumnOnlyOutputStream::write(const Block & block)
+         {
+             const auto & col = block.safeGetByPosition(i);
+ 
+-            addStreams(part_path, col.name, *col.type, 0, skip_offsets);
++            const auto columns = storage.getColumns();
++            addStreams(part_path, col.name, *col.type, columns.getCodec(col.name), 0, skip_offsets);
+             serialization_states.emplace_back(nullptr);
+             settings.getter = createStreamGetter(col.name, tmp_offset_columns, false);
+             col.type->serializeBinaryBulkStatePrefix(settings, serialization_states.back());
+diff --git a/dbms/src/Storages/MergeTree/MergedBlockOutputStream.h b/dbms/src/Storages/MergeTree/MergedBlockOutputStream.h
+index 947b982d7..a93a64b48 100644
+--- a/dbms/src/Storages/MergeTree/MergedBlockOutputStream.h
++++ b/dbms/src/Storages/MergeTree/MergedBlockOutputStream.h
+@@ -36,8 +36,8 @@ protected:
+             const std::string & data_file_extension_,
+             const std::string & marks_path,
+             const std::string & marks_file_extension_,
++            const CompressionCodecPtr & compression_codec,
+             size_t max_compress_block_size,
+-            CompressionSettings compression_settings,
+             size_t estimated_size,
+             size_t aio_threshold);
+ 
+@@ -48,7 +48,7 @@ protected:
+         /// compressed -> compressed_buf -> plain_hashing -> plain_file
+         std::unique_ptr<WriteBufferFromFileBase> plain_file;
+         HashingWriteBuffer plain_hashing;
+-        CompressedWriteBuffer compressed_buf;
++        WriteBufferPtr compressed_buf;
+         HashingWriteBuffer compressed;
+ 
+         /// marks -> marks_file
+@@ -64,7 +64,8 @@ protected:
+ 
+     using ColumnStreams = std::map<String, std::unique_ptr<ColumnStream>>;
+ 
+-    void addStreams(const String & path, const String & name, const IDataType & type, size_t estimated_size, bool skip_offsets);
++    void addStreams(const String & path, const String & name, const IDataType & type,
++                    const CompressionCodecPtr & codec, size_t estimated_size, bool skip_offsets);
+ 
+ 
+     IDataType::OutputStreamGetter createStreamGetter(const String & name, OffsetColumns & offset_columns, bool skip_offsets);

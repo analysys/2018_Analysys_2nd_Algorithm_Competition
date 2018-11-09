@@ -1,0 +1,14 @@
+1、计算出20180601-20180610范围内，依次有序触发“addCart-加入购物车”、“order-生成订单”、“orderPayment-订单付款”、“evaluationGoods-评价商品”的用户转换情况以及各步骤转换时间中位数，且满足时间窗口为1天，且要求“order-生成订单”与“evaluationGoods-评价商品”对应的“brand-商品品牌”属性相同。
+
+2、计算出20180620-20180701范围内，依次有序触发“searchGoods-搜索商品”、“consultGoods-咨询商品”、“addCart-加入购物车”、“confirm-确认收货”的用户转换情况以及各步骤转换时间中位数，且满足时间窗口为7天，且要求“addCart-加入购物车”与“confirm-确认收货”对应的“name-名称”属性相同。
+
+
+3、	计算出2018年6月份中，依次有序触发 “searchGoods-搜索商品”、“consultGoods咨询商品”、“order-生成订单”的用户转换情况以及各步骤转换时间中位数，且满足时间窗口为7天，且结果按“consultGoods咨询商品”的“商品名称”属性分组。
+
+4、	计算出2018年6月份中，依次有序触发 “consultGoods-咨询商品”、“shareGoods分享商品”、“confirm确认收货”、“evaluationGoods-评价商品”的用户转换情况以及各步骤转换时间中位数，且满足时间窗口为30天，且结果按“evaluationGoods-评价商品”的“商品品牌”属性分组。
+
+5,计算出20180601-20180710，依次有序触发“login登陆”、“consultGoods-咨询商品”、“confirm确认收货”、“unsubscribeGoods-退订商品”的用户转换情况以及各步骤转换时间中位数，且满足时间窗口为30天，且“consultGoods咨询商品”、“unsubscribeGoods-退订商品”的“brand-品牌”相等，且结果按“unsubscribeGoods-退订商品”的城市属性进行分组
+
+
+6,计算出2018年6月份中，依次有序触发“searchGoods-搜索商品”、“consultGoods咨询商品”、“addCart-加入购物车”、“orderPayment-订单付款”的用户转换情况以及各步骤转换时间中位数，且满足时间窗口为7天，且“consultGoods咨询商品”、“addCart-加入购物车”的“name-名称”相等，且结果按“consultGoods-咨询商品”的商品价格进行分组，价格分层条件为2000元以下,【2000-3000）,3000以上.
+
